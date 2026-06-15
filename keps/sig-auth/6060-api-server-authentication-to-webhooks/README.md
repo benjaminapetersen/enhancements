@@ -23,6 +23,9 @@
   - [New Private Claims](#new-private-claims)
   - [BoundObjectRef for APIService](#boundobjectref-for-apiservice)
   - [RBAC Configuration](#rbac-configuration)
+  - [Sequence Diagrams](#sequence-diagrams)
+    - [Flow 1: Kube-apiserver authenticates to an admission webhook](#flow-1-kube-apiserver-authenticates-to-an-admission-webhook)
+    - [Flow 2: Aggregated API server authenticates to an admission webhook](#flow-2-aggregated-api-server-authenticates-to-an-admission-webhook)
   - [Kube-apiserver Service Account Lifecycle](#kube-apiserver-service-account-lifecycle)
   - [Test Plan](#test-plan)
       - [Prerequisite testing updates](#prerequisite-testing-updates)
@@ -553,6 +556,93 @@ rules:
   resources: ["apiservices"]
   resourceNames: ["v1.example.com"]
   verbs: ["attest"]
+```
+
+### Sequence Diagrams
+
+The following diagrams illustrate the two primary flows for WAT issuance
+and webhook authentication.
+
+#### Flow 1: Kube-apiserver authenticates to an admission webhook
+
+In this flow, `kube-apiserver` is both the issuer and the consumer of the
+WAT. It requests a token from itself (in-process) for its own dedicated
+service account, bound to the APIService for the resource being admitted.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant KAS as kube-apiserver
+    participant RBAC as Authorization (in-process)
+    participant TokenReq as TokenRequest (in-process)
+    participant Webhook as Admission Webhook
+
+    User->>KAS: Create/Update resource (e.g., Pod)
+    Note over KAS: Admission requires consulting webhook
+
+    KAS->>KAS: Check WAT cache for webhook + APIService
+    alt Cache miss or token expired
+        KAS->>TokenReq: TokenRequest for dedicated SA<br/>BoundObjectRef: APIService (e.g., v1.)<br/>Audience: k8s.io:admission:<webhook-name>
+        TokenReq->>RBAC: 1. Can caller create serviceaccounts/token<br/>for the dedicated SA?
+        RBAC-->>TokenReq: ✓ Allowed (kube-apiserver always succeeds)
+        TokenReq->>KAS: 2. Does the APIService object exist?
+        KAS-->>TokenReq: ✓ Exists
+        TokenReq->>RBAC: 3. Does the dedicated SA have<br/>"attest" on the APIService?
+        RBAC-->>TokenReq: ✓ Allowed
+        TokenReq-->>KAS: WAT issued (JWT with APIService private claims)
+        Note over KAS: Cache the WAT
+    end
+
+    KAS->>Webhook: AdmissionReview + Authorization: Bearer <WAT>
+    Note over Webhook: 1. Verify JWT signature (OIDC discovery)<br/>2. Verify audience matches webhook identity<br/>3. Verify APIService claims match<br/>   resource in AdmissionReview body
+    Webhook-->>KAS: AdmissionReview response
+    KAS-->>User: Response
+```
+
+#### Flow 2: Aggregated API server authenticates to an admission webhook
+
+In this flow, the aggregated API server is a separate process that must
+authenticate to `kube-apiserver` first, then request a WAT for its own
+dedicated service account. The token is bound to the APIService the
+aggregated API server serves.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant AAS as Aggregated API Server
+    participant KAS as kube-apiserver
+    participant RBAC as Authorization (in kube-apiserver)
+    participant TokenReq as TokenRequest (in kube-apiserver)
+    participant Webhook as Admission Webhook
+
+    User->>KAS: Create/Update custom resource (e.g., Widget)
+    KAS->>AAS: Proxy request to aggregated API server
+
+    Note over AAS: Admission requires consulting webhook
+    AAS->>AAS: Check WAT cache for webhook + APIService
+
+    alt Cache miss or token expired
+        AAS->>KAS: Authenticate (using configured credential)
+        KAS-->>AAS: Authenticated
+
+        AAS->>KAS: TokenRequest for dedicated SA<br/>BoundObjectRef: APIService (e.g., v1.example.com)<br/>Audience: k8s.io:admission:<webhook-name>
+        KAS->>RBAC: 1. Can caller create serviceaccounts/token<br/>for the dedicated SA?
+        RBAC-->>KAS: ✓ Allowed (RBAC Role + RoleBinding)
+        KAS->>KAS: 2. Does APIService v1.example.com exist?
+        KAS-->>KAS: ✓ Exists
+        KAS->>RBAC: 3. Does the dedicated SA have<br/>"attest" on APIService v1.example.com?
+        RBAC-->>KAS: ✓ Allowed (ClusterRole + ClusterRoleBinding)
+        KAS->>TokenReq: Issue WAT
+        TokenReq-->>KAS: WAT (JWT with APIService private claims)
+        KAS-->>AAS: WAT returned
+        Note over AAS: Cache the WAT
+    end
+
+    AAS->>Webhook: AdmissionReview + Authorization: Bearer <WAT>
+    Note over Webhook: 1. Verify JWT signature (OIDC discovery)<br/>2. Verify audience matches webhook identity<br/>3. Verify APIService claims match<br/>   resource in AdmissionReview body
+    Webhook-->>AAS: AdmissionReview response
+    AAS-->>KAS: Admission complete, return response
+    KAS-->>User: Response
 ```
 
 ### Kube-apiserver Service Account Lifecycle
